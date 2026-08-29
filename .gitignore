@@ -2,3 +2,7 @@ env/
 __pycache__/
 *.pyc
 .DS_Store
+*.pdf
+.env
+assets/*.json
+*_vocab.json

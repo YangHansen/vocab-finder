@@ -1,5 +1,4 @@
-kiwipiepy==0.23.2
-kiwipiepy_model==0.23.0
-numpy==2.5.2
-pypdf==6.16.2
-tqdm==4.70.0
+google-genai
+kiwipiepy
+pypdfium2
+python-dotenv
