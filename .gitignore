@@ -9,3 +9,4 @@ assets/*.tsv
 *_vocab.json
 *_by_chapter.json
 *_anki.tsv
+*_checkpoint.json

@@ -12,12 +12,17 @@ from google.genai import types
 import pypdfium2 as pdfium
 
 # Scanned textbooks overflow a single generation if chunks are too large: the model
-# returns valid JSON but only a sampled subset (see Practical 2.pdf vs Test.pdf).
+# returns valid JSON but only a sampled subset.
 DEFAULT_CHUNK_SIZE = 8
 # Free-tier Flash Lite has ~500 RPD vs 20 RPD on Flash/Pro. Native PDF + image input.
 DEFAULT_MODEL = os.environ.get("GEMINI_MODEL", "gemini-3.5-flash-lite")
 MAX_OUTPUT_TOKENS = 65536
 API_CALL_PAUSE_SECONDS = 4
+# Abort hung Gemini calls.
+REQUEST_TIMEOUT_SECONDS = 240
+REQUEST_TIMEOUT_MS = REQUEST_TIMEOUT_SECONDS * 1000
+# Stop a run after this many unsuccessful Gemini calls so retries/splits cannot drain RPD.
+DEFAULT_MAX_FAILURES = 5
 
 def ensure_environment_files():
     """Ensures .env.example exists and checks for GEMINI_API_KEY."""
@@ -68,9 +73,10 @@ def get_pdf_page_count(pdf_path):
     """Returns the number of pages in a PDF."""
     return len(pdfium.PdfDocument(pdf_path))
 
-def iter_page_ranges(total_pages, chunk_size):
-    """Yields inclusive 1-based (start, end) page ranges."""
-    for start_idx in range(0, total_pages, chunk_size):
+def iter_page_ranges(total_pages, chunk_size, start_page=1):
+    """Yields inclusive 1-based (start, end) page ranges, optionally skipping completed pages."""
+    start_idx = max(0, start_page - 1)
+    for start_idx in range(start_idx, total_pages, chunk_size):
         end_idx = min(start_idx + chunk_size, total_pages)
         yield start_idx + 1, end_idx
 
@@ -106,6 +112,31 @@ class DailyQuotaExceeded(Exception):
         self.original = original
         super().__init__(str(original))
 
+class ExtractionBudgetExceeded(Exception):
+    """Raised when too many Gemini calls failed in one run (protects remaining RPD)."""
+
+    def __init__(self, wasted, limit):
+        self.wasted = wasted
+        self.limit = limit
+        super().__init__(
+            f"Stopped after {wasted} failed API requests (limit {limit}) to protect daily quota."
+        )
+
+class RequestBudget:
+    """Counts unsuccessful generate_content calls and halts when the cap is reached."""
+
+    def __init__(self, max_failures=DEFAULT_MAX_FAILURES):
+        self.max_failures = max_failures
+        self.wasted = 0
+
+    def note_waste(self, reason=""):
+        self.wasted += 1
+        cap = "unlimited" if self.max_failures <= 0 else str(self.max_failures)
+        suffix = f" ({reason})" if reason else ""
+        print(f"  Failed API calls this run: {self.wasted}/{cap}{suffix}")
+        if self.max_failures > 0 and self.wasted >= self.max_failures:
+            raise ExtractionBudgetExceeded(self.wasted, self.max_failures)
+
 def _is_rate_limit_error(exc):
     """True for free-tier RPM/RPD quota errors."""
     code = getattr(exc, "code", None) or getattr(exc, "status_code", None)
@@ -125,11 +156,19 @@ def _is_daily_quota_error(exc):
     # RPM errors usually include a retry delay. A bare quota 429 is the daily cap.
     return "retry in" not in text and "retry-after" not in text
 
+def _is_timeout_error(exc):
+    """True when the HTTP client gave up waiting for Gemini."""
+    name = type(exc).__name__.lower()
+    text = str(exc).lower()
+    markers = ("timeout", "timed out", "deadline exceeded", "readtimeout", "connecttimeout")
+    return any(marker in name or marker in text for marker in markers)
+
 def _build_generate_config(model):
     """Build generation config, using Gemini 3-only options only on 3.x models."""
     kwargs = {
         "response_mime_type": "application/json",
         "max_output_tokens": MAX_OUTPUT_TOKENS,
+        "http_options": types.HttpOptions(timeout=REQUEST_TIMEOUT_MS),
     }
     name = (model or "").lower()
     if "gemini-3" in name:
@@ -142,7 +181,7 @@ def _build_generate_config(model):
         kwargs["thinking_config"] = types.ThinkingConfig(thinking_budget=0)
     return types.GenerateContentConfig(**kwargs)
 
-def process_chunk_with_gemini(client, chunk_path, start_page, end_page, model=DEFAULT_MODEL, max_retries=3):
+def process_chunk_with_gemini(client, chunk_path, start_page, end_page, model=DEFAULT_MODEL, max_retries=3, budget=None):
     """Uploads a PDF chunk to Gemini and extracts structured vocabulary JSON with retries.
 
     Returns (vocab_items, finish_reason, parse_ok). parse_ok is False when JSON could
@@ -155,8 +194,15 @@ def process_chunk_with_gemini(client, chunk_path, start_page, end_page, model=DE
     try:
         uploaded_file = client.files.upload(file=chunk_path)
 
+        waited = 0
         while uploaded_file.state.name == "PROCESSING":
             time.sleep(2)
+            waited += 2
+            if waited >= REQUEST_TIMEOUT_SECONDS:
+                print(f"  File processing timed out after {REQUEST_TIMEOUT_SECONDS}s for pages {start_page}–{end_page}.")
+                if budget:
+                    budget.note_waste("upload processing timeout")
+                return [], "TIMEOUT", False
             uploaded_file = client.files.get(name=uploaded_file.name)
 
         prompt = """
@@ -210,6 +256,8 @@ def process_chunk_with_gemini(client, chunk_path, start_page, end_page, model=DE
                 raw_text = (response.text or "").strip()
                 if not raw_text:
                     print(f"  Warning: Empty model response for pages {start_page}–{end_page} ({finish_reason}).")
+                    if budget:
+                        budget.note_waste("empty response")
                     if finish_reason == "MAX_TOKENS":
                         return [], finish_reason, False
                     if attempt < max_retries:
@@ -233,6 +281,8 @@ def process_chunk_with_gemini(client, chunk_path, start_page, end_page, model=DE
 
             except json.JSONDecodeError:
                 print(f"  Warning: JSON decode attempt {attempt}/{max_retries} failed for pages {start_page}–{end_page} (finish={finish_reason}).")
+                if budget:
+                    budget.note_waste("invalid JSON")
                 # Truncated JSON will not become valid by retrying the same range.
                 if finish_reason == "MAX_TOKENS":
                     return [], finish_reason, False
@@ -240,12 +290,22 @@ def process_chunk_with_gemini(client, chunk_path, start_page, end_page, model=DE
                     time.sleep(2 * attempt)
                 else:
                     return [], finish_reason, False
-            except DailyQuotaExceeded:
+            except (DailyQuotaExceeded, ExtractionBudgetExceeded, KeyboardInterrupt):
                 raise
             except Exception as e:
                 print(f"  Warning: API call attempt {attempt}/{max_retries} encountered error: {e}")
                 if _is_daily_quota_error(e):
                     raise DailyQuotaExceeded(model, e) from e
+                if _is_timeout_error(e):
+                    print(
+                        f"  Request timed out after {REQUEST_TIMEOUT_SECONDS}s "
+                        f"for pages {start_page}–{end_page}."
+                    )
+                    if budget:
+                        budget.note_waste("request timeout")
+                    return [], "TIMEOUT", False
+                if budget:
+                    budget.note_waste("api error")
                 if attempt < max_retries:
                     if _is_rate_limit_error(e):
                         wait_time = 30 * attempt
@@ -272,19 +332,19 @@ def _should_resplit(page_count, items, finish_reason, parse_ok):
     """True when this range should be split and re-extracted."""
     if page_count <= 1:
         return False
-    if not parse_ok or finish_reason == "MAX_TOKENS":
+    if not parse_ok or finish_reason in {"MAX_TOKENS", "TIMEOUT"}:
         return True
     # Model often "completes" a large scanned range with a sampled subset (valid JSON).
     # Default 8-page chunks skip this; larger --chunk-size values still get bisected.
     min_expected = page_count * 3
     return page_count > DEFAULT_CHUNK_SIZE and len(items) < min_expected
 
-def extract_vocab_from_range(client, pdf_path, start_page, end_page, model=DEFAULT_MODEL, max_retries=3):
+def extract_vocab_from_range(client, pdf_path, start_page, end_page, model=DEFAULT_MODEL, max_retries=3, budget=None):
     """Extracts vocabulary for a page range, bisecting if output is truncated or unparseable."""
     page_count = end_page - start_page + 1
     chunk_path = write_pdf_chunk(pdf_path, start_page, end_page)
     items, finish_reason, parse_ok = process_chunk_with_gemini(
-        client, chunk_path, start_page, end_page, model=model, max_retries=max_retries
+        client, chunk_path, start_page, end_page, model=model, max_retries=max_retries, budget=budget
     )
     time.sleep(API_CALL_PAUSE_SECONDS)
 
@@ -295,8 +355,12 @@ def extract_vocab_from_range(client, pdf_path, start_page, end_page, model=DEFAU
             f"(finish={finish_reason}, parsed={len(items)}). Splitting into "
             f"{start_page}–{mid} and {mid + 1}–{end_page}..."
         )
-        left = extract_vocab_from_range(client, pdf_path, start_page, mid, model=model, max_retries=max_retries)
-        right = extract_vocab_from_range(client, pdf_path, mid + 1, end_page, model=model, max_retries=max_retries)
+        left = extract_vocab_from_range(
+            client, pdf_path, start_page, mid, model=model, max_retries=max_retries, budget=budget
+        )
+        right = extract_vocab_from_range(
+            client, pdf_path, mid + 1, end_page, model=model, max_retries=max_retries, budget=budget
+        )
         return left + right
 
     print(f"  Extracted {len(items)} terms from pages {start_page}–{end_page}.")
@@ -440,67 +504,169 @@ def export_anki_tsv(vocab_list, output_path):
                 item.get("example_english", "")
             ])
 
-def process_pdf(selected_pdf, client, assets_dir, chunk_size=DEFAULT_CHUNK_SIZE, model=DEFAULT_MODEL, export_anki=True, export_grouped=True):
+def _checkpoint_path(assets_dir, pdf_path):
+    return assets_dir / f"{pdf_path.stem}_checkpoint.json"
+
+def _pdf_fingerprint(pdf_path):
+    stat = pdf_path.stat()
+    return {"name": pdf_path.name, "size": stat.st_size, "mtime": int(stat.st_mtime)}
+
+def _write_json_atomic(path, payload):
+    tmp_path = path.with_suffix(path.suffix + ".tmp")
+    tmp_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    tmp_path.replace(path)
+
+def load_checkpoint(assets_dir, pdf_path):
+    """Returns a valid checkpoint dict, or None if missing/mismatched."""
+    path = _checkpoint_path(assets_dir, pdf_path)
+    if not path.exists():
+        return None
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    if data.get("pdf") != _pdf_fingerprint(pdf_path):
+        print(f"Ignoring checkpoint {path.name} (PDF file changed).")
+        return None
+    return data
+
+def save_checkpoint(assets_dir, pdf_path, total_pages, last_completed_end_page, vocab_map, chunk_size, model):
+    """Persists in-progress vocabulary so a later run can skip completed pages."""
+    payload = {
+        "pdf": _pdf_fingerprint(pdf_path),
+        "total_pages": total_pages,
+        "last_completed_end_page": last_completed_end_page,
+        "chunk_size": chunk_size,
+        "model": model,
+        "vocab": list(vocab_map.values()),
+    }
+    path = _checkpoint_path(assets_dir, pdf_path)
+    _write_json_atomic(path, payload)
+    print(
+        f"  Checkpoint saved: {path.name} "
+        f"(through page {last_completed_end_page}/{total_pages}, {len(vocab_map)} terms)."
+    )
+
+def clear_checkpoint(assets_dir, pdf_path):
+    _checkpoint_path(assets_dir, pdf_path).unlink(missing_ok=True)
+
+def merge_vocab_item(all_vocab_map, item):
+    korean_word = item.get("korean")
+    if not korean_word:
+        return
+    if korean_word not in all_vocab_map:
+        all_vocab_map[korean_word] = item
+        return
+    existing = all_vocab_map[korean_word]
+    if not existing.get("example_korean") and item.get("example_korean"):
+        existing["example_korean"] = item.get("example_korean")
+        existing["example_english"] = item.get("example_english", "")
+
+def process_pdf(selected_pdf, client, assets_dir, chunk_size=DEFAULT_CHUNK_SIZE, model=DEFAULT_MODEL, export_anki=True, export_grouped=True, fresh=False, max_failures=DEFAULT_MAX_FAILURES):
     """Processes a single PDF file through the extraction and formatting pipeline."""
     total_pages = get_pdf_page_count(selected_pdf)
     print(f"\nTotal pages in '{selected_pdf.name}': {total_pages} (chunk size: {chunk_size})")
 
     all_vocab_map = {}
+    resume_from_page = 1
+    last_completed_end_page = 0
+
+    if not fresh:
+        checkpoint = load_checkpoint(assets_dir, selected_pdf)
+        if checkpoint:
+            for item in checkpoint.get("vocab") or []:
+                merge_vocab_item(all_vocab_map, item)
+            last_completed_end_page = int(checkpoint.get("last_completed_end_page") or 0)
+            resume_from_page = last_completed_end_page + 1
+            print(
+                f"Resuming from page {resume_from_page} "
+                f"({len(all_vocab_map)} terms already saved). Use --fresh to start over."
+            )
+
+    budget = RequestBudget(max_failures)
 
     try:
-        for start_page, end_page in iter_page_ranges(total_pages, chunk_size):
+        for start_page, end_page in iter_page_ranges(total_pages, chunk_size, start_page=resume_from_page):
             print(f"\nProcessing chunk: Pages {start_page} to {end_page} of {total_pages}...")
 
             vocab_items = extract_vocab_from_range(
-                client, selected_pdf, start_page, end_page, model=model
+                client, selected_pdf, start_page, end_page, model=model, budget=budget
             )
 
-            # Deduplicate terms using the base Korean word as dictionary key
             for item in vocab_items:
-                korean_word = item.get("korean")
-                if korean_word:
-                    if korean_word not in all_vocab_map:
-                        all_vocab_map[korean_word] = item
-                    else:
-                        existing = all_vocab_map[korean_word]
-                        if not existing.get("example_korean") and item.get("example_korean"):
-                            existing["example_korean"] = item.get("example_korean")
-                            existing["example_english"] = item.get("example_english", "")
+                merge_vocab_item(all_vocab_map, item)
 
+            last_completed_end_page = end_page
             print(f"Retained {len(all_vocab_map)} total unique terms so far.")
+            save_checkpoint(
+                assets_dir, selected_pdf, total_pages, last_completed_end_page,
+                all_vocab_map, chunk_size, model,
+            )
+            _write_vocab_outputs(
+                selected_pdf, assets_dir, list(all_vocab_map.values()),
+                export_anki, export_grouped, quiet=True,
+            )
     except DailyQuotaExceeded:
         if all_vocab_map:
             print(f"\nDaily quota hit. Saving {len(all_vocab_map)} terms extracted so far...")
+            save_checkpoint(
+                assets_dir, selected_pdf, total_pages, last_completed_end_page,
+                all_vocab_map, chunk_size, model,
+            )
             _write_vocab_outputs(selected_pdf, assets_dir, list(all_vocab_map.values()), export_anki, export_grouped)
+        raise
+    except ExtractionBudgetExceeded:
+        print(f"\nToo many failed API calls. Saving checkpoint to protect remaining daily quota...")
+        save_checkpoint(
+            assets_dir, selected_pdf, total_pages, last_completed_end_page,
+            all_vocab_map, chunk_size, model,
+        )
+        if all_vocab_map:
+            _write_vocab_outputs(selected_pdf, assets_dir, list(all_vocab_map.values()), export_anki, export_grouped)
+        raise
+    except KeyboardInterrupt:
+        if all_vocab_map or last_completed_end_page:
+            print("\nInterrupted. Saving checkpoint so you can continue later...")
+            save_checkpoint(
+                assets_dir, selected_pdf, total_pages, last_completed_end_page,
+                all_vocab_map, chunk_size, model,
+            )
+            if all_vocab_map:
+                _write_vocab_outputs(
+                    selected_pdf, assets_dir, list(all_vocab_map.values()),
+                    export_anki, export_grouped,
+                )
         raise
 
     combined_vocab_list = list(all_vocab_map.values())
     _write_vocab_outputs(selected_pdf, assets_dir, combined_vocab_list, export_anki, export_grouped)
+    clear_checkpoint(assets_dir, selected_pdf)
     print("\n==========================================")
     print(f"SUCCESS! Extracted {len(combined_vocab_list)} total unique terms from {selected_pdf.name}.")
     print("==========================================")
 
-def _write_vocab_outputs(selected_pdf, assets_dir, combined_vocab_list, export_anki, export_grouped, title_map=None):
+def _write_vocab_outputs(selected_pdf, assets_dir, combined_vocab_list, export_anki, export_grouped, title_map=None, quiet=False):
     """Writes flat JSON, optional grouped JSON, and optional Anki TSV."""
     combined_vocab_list = canonicalize_chapters(combined_vocab_list, title_map=title_map)
     flat_output_path = assets_dir / f"{selected_pdf.stem}_vocab.json"
     with open(flat_output_path, "w", encoding="utf-8") as f:
         json.dump(combined_vocab_list, f, ensure_ascii=False, indent=2)
-    print(f"\nSaved flat vocabulary list to: {flat_output_path}")
+    if not quiet:
+        print(f"\nSaved flat vocabulary list to: {flat_output_path}")
 
-    # 2. Save Chapter & Theme hierarchical grouping
     if export_grouped:
         grouped_data = group_vocab_by_chapter(combined_vocab_list)
         grouped_output_path = assets_dir / f"{selected_pdf.stem}_by_chapter.json"
         with open(grouped_output_path, "w", encoding="utf-8") as f:
             json.dump(grouped_data, f, ensure_ascii=False, indent=2)
-        print(f"Saved chapter/theme grouped dataset to: {grouped_output_path}")
+        if not quiet:
+            print(f"Saved chapter/theme grouped dataset to: {grouped_output_path}")
 
-    # 3. Save Anki/SRS TSV format
     if export_anki:
         anki_output_path = assets_dir / f"{selected_pdf.stem}_anki.tsv"
         export_anki_tsv(combined_vocab_list, anki_output_path)
-        print(f"Saved Anki SRS flashcards export to: {anki_output_path}")
+        if not quiet:
+            print(f"Saved Anki SRS flashcards export to: {anki_output_path}")
 
 def parse_arguments():
     """Parses command line arguments."""
@@ -512,6 +678,8 @@ def parse_arguments():
     parser.add_argument("--no-anki", action="store_true", help="Disable generating Anki TSV export file.")
     parser.add_argument("--no-grouped", action="store_true", help="Disable generating chapter/theme grouped JSON file.")
     parser.add_argument("--normalize", action="store_true", help="Rewrite chapter labels in existing assets/*_vocab.json files without calling the API.")
+    parser.add_argument("--fresh", action="store_true", help="Ignore any checkpoint and extract the PDF from page 1.")
+    parser.add_argument("--max-failures", type=int, default=DEFAULT_MAX_FAILURES, help=f"Stop the run after this many failed Gemini calls to protect RPD (default: {DEFAULT_MAX_FAILURES}; 0 = unlimited).")
     return parser.parse_args()
 
 def normalize_existing_outputs(assets_dir, export_anki=True, export_grouped=True):
@@ -565,7 +733,7 @@ def main():
     assets_dir, pdf_files = ensure_assets_directory()
 
     # 3. Initialize Gemini API Client
-    client = genai.Client()
+    client = genai.Client(http_options=types.HttpOptions(timeout=REQUEST_TIMEOUT_MS))
 
     export_anki = not args.no_anki
     export_grouped = not args.no_grouped
@@ -621,12 +789,24 @@ def main():
                 chunk_size=args.chunk_size,
                 model=args.model,
                 export_anki=export_anki,
-                export_grouped=export_grouped
+                export_grouped=export_grouped,
+                fresh=args.fresh,
+                max_failures=args.max_failures,
             )
+        except KeyboardInterrupt:
+            print("\nStopped. Re-run the same command to continue from the last finished chunk.")
+            sys.exit(130)
+        except ExtractionBudgetExceeded as e:
+            print("\n==========================================")
+            print(f"STOPPED: {e.wasted} failed Gemini requests (limit {e.limit}) to protect remaining RPD.")
+            print("A checkpoint was saved. Re-run the same command later to continue from the last finished chunk.")
+            print("==========================================")
+            sys.exit(1)
         except DailyQuotaExceeded as e:
             print("\n==========================================")
             print(f"STOPPED: daily request quota (RPD) exhausted for model '{e.model}'.")
             print("RPD is per model and resets at midnight Pacific Time. Waiting/retrying will not help.")
+            print("A checkpoint was saved. Re-run the same command tomorrow (or with another model) to continue.")
             print("Switch to a different model (separate daily pool), for example:")
             print(f'  python extractor_engine.py --pdf "{pdf.name}" --model gemini-3.5-flash-lite')
             print("==========================================")

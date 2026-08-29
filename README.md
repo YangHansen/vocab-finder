@@ -142,6 +142,8 @@ python extractor_engine.py --all --no-anki
 | `--chunk-size`, `-c` | `8` | Number of PDF pages per chunk sent to Gemini. Smaller chunks extract more completely from scanned textbooks. |
 | `--model`, `-m` | `gemini-3.5-flash-lite` | Gemini model ID. Flash Lite is ~500 RPD on the free tier; regular Flash/Pro are ~20 RPD. |
 | `--normalize` | `False` | Rewrite chapter labels in existing `assets/*_vocab.json` files (no API call). |
+| `--fresh` | `False` | Ignore a checkpoint and extract from page 1. Interrupted runs resume automatically. |
+| `--max-failures` | `5` | Stop after this many failed Gemini calls (timeouts, bad JSON, API errors) so retries cannot drain daily quota. `0` disables the cap. |
 | `--no-anki` | `False` | Disable generating the `*_anki.tsv` file |
 | `--no-grouped` | `False` | Disable generating the `*_by_chapter.json` file |
 
