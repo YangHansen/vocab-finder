@@ -562,7 +562,29 @@ def merge_vocab_item(all_vocab_map, item):
         existing["example_korean"] = item.get("example_korean")
         existing["example_english"] = item.get("example_english", "")
 
+def format_elapsed(seconds):
+    """Formats a duration as '1h 2m 3s', '12m 4s', or '9s'."""
+    total = max(0, int(round(seconds)))
+    hours, remainder = divmod(total, 3600)
+    minutes, secs = divmod(remainder, 60)
+    if hours:
+        return f"{hours}h {minutes}m {secs}s"
+    if minutes:
+        return f"{minutes}m {secs}s"
+    return f"{secs}s"
+
 def process_pdf(selected_pdf, client, assets_dir, chunk_size=DEFAULT_CHUNK_SIZE, model=DEFAULT_MODEL, export_anki=True, export_grouped=True, fresh=False, max_failures=DEFAULT_MAX_FAILURES):
+    """Processes a single PDF file through the extraction and formatting pipeline."""
+    started = time.perf_counter()
+    try:
+        _process_pdf(
+            selected_pdf, client, assets_dir, chunk_size, model,
+            export_anki, export_grouped, fresh, max_failures,
+        )
+    finally:
+        print(f"Time spent: {format_elapsed(time.perf_counter() - started)}")
+
+def _process_pdf(selected_pdf, client, assets_dir, chunk_size=DEFAULT_CHUNK_SIZE, model=DEFAULT_MODEL, export_anki=True, export_grouped=True, fresh=False, max_failures=DEFAULT_MAX_FAILURES):
     """Processes a single PDF file through the extraction and formatting pipeline."""
     total_pages = get_pdf_page_count(selected_pdf)
     print(f"\nTotal pages in '{selected_pdf.name}': {total_pages} (chunk size: {chunk_size})")
@@ -777,6 +799,7 @@ def main():
                 sys.exit(1)
 
     # 5. Process target PDF(s)
+    batch_started = time.perf_counter()
     for pdf in target_pdfs:
         print(f"\n==========================================")
         print(f"Starting extraction for: {pdf.name}")
@@ -811,6 +834,9 @@ def main():
             print(f'  python extractor_engine.py --pdf "{pdf.name}" --model gemini-3.5-flash-lite')
             print("==========================================")
             sys.exit(1)
+
+    if len(target_pdfs) > 1:
+        print(f"\nTotal time spent: {format_elapsed(time.perf_counter() - batch_started)}")
 
 if __name__ == "__main__":
     main()
