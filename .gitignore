@@ -5,4 +5,7 @@ __pycache__/
 *.pdf
 .env
 assets/*.json
+assets/*.tsv
 *_vocab.json
+*_by_chapter.json
+*_anki.tsv
